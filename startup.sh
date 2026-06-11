@@ -2,10 +2,14 @@
 
 # Cores para o output
 GREEN='\033[1;32m'   # Verde claro/brilhante
-RED='\033[1;31m'     # Vermelho claro
-YELLOW='\033[1;33m'  # Amarelo/Laranja suave
-BLUE='\033[1;34m'    # Azul claro/Ciano
+RED='\033[0;31m'     # Vermelho suave (menos forte)
+YELLOW='\033[0;33m'  # Amarelo suave (sem tom alaranjado)
+BLUE='\033[1;36m'    # Azul ciano claro/brilhante
 NC='\033[0m'         # Sem cor
+
+# Modo não interativo para evitar prompts de senha do MariaDB durante apt
+export DEBIAN_FRONTEND=noninteractive
+export MYSQL_PWD=""
 
 BASE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 WWW_DIR="$BASE_DIR/www"
@@ -16,6 +20,62 @@ check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}[ERRO] Por favor, execute este script usando sudo!${NC}"
         exit 1
+    fi
+}
+
+# Verifica e libera o lock do dpkg antes de qualquer operação com apt
+liberar_lock() {
+    local lock_file="/var/lib/dpkg/lock-frontend"
+    local lock_file_old="/var/lib/dpkg/lock"
+    local count=0
+    local max_wait=30
+
+    # Corrige dpkg interrompido antes de qualquer operação
+    if dpkg --audit 2>/dev/null | grep -q .; then
+        echo -e "${YELLOW}[dpkg] Estado inconsistente detectado. Executando dpkg --configure -a...${NC}"
+        dpkg --configure -a 2>/dev/null
+        echo -e "${GREEN}[OK] dpkg recuperado.${NC}"
+    fi
+
+    while [ -f "$lock_file" ] || [ -f "$lock_file_old" ]; do
+        local pid=""
+        if [ -f "$lock_file" ]; then
+            pid=$(fuser "$lock_file" 2>/dev/null | awk '{print $1}')
+        elif [ -f "$lock_file_old" ]; then
+            pid=$(fuser "$lock_file_old" 2>/dev/null | awk '{print $1}')
+        fi
+
+        if [ -n "$pid" ]; then
+            local pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+            echo -e "${YELLOW}[LOCK] dpkg bloqueado por processo $pid ($pname)${NC}"
+
+            if [ "$count" -ge "$max_wait" ]; then
+                echo -e "${YELLOW}Tempo esgotado. Deseja forçar a remoção do lock? (y/n):${NC} "
+                read -r answer
+                if [[ "$answer" =~ ^[Yy]$ ]]; then
+                    echo -e "${RED}--> Matando processo $pid ($pname)...${NC}"
+                    kill -9 "$pid" 2>/dev/null
+                    rm -f "$lock_file" "$lock_file_old" 2>/dev/null
+                    echo -e "${GREEN}[OK] Lock removido.${NC}"
+                    break
+                else
+                    echo -e "${RED}Operação cancelada.${NC}"
+                    exit 1
+                fi
+            fi
+
+            echo -e "${YELLOW}Aguardando liberação do lock (${count}s/${max_wait}s)...${NC}"
+            sleep 1
+            count=$((count + 1))
+        else
+            echo -e "${YELLOW}[LOCK] Lock órfão. Removendo...${NC}"
+            rm -f "$lock_file" "$lock_file_old" 2>/dev/null
+            break
+        fi
+    done
+
+    if [ "$count" -gt 0 ]; then
+        echo -e "${GREEN}[OK] Lock liberado após ${count}s.${NC}"
     fi
 }
 
@@ -46,6 +106,23 @@ validar_infra() {
 
     check_port 65011 "phpMyAdmin Web"
     check_port 65014 "Painel de Impressão CUPS"
+
+    # Tenta iniciar o CUPS se não estiver respondendo na porta
+    if ! netstat -tuln 2>/dev/null | grep -q ":65014 "; then
+        if systemctl is-active --quiet cups 2>/dev/null; then
+            echo -e "${YELLOW}-> CUPS ativo mas não na porta 65014. Verificando config...${NC}"
+        else
+            echo -e "${YELLOW}-> CUPS parado. Tentando iniciar...${NC}"
+            systemctl start cups
+            sleep 2
+            if systemctl is-active --quiet cups; then
+                echo -e "[ ${GREEN}OK${NC} ] CUPS iniciado com sucesso."
+            else
+                echo -e "[ ${RED}FALHA${NC} ] Não foi possível iniciar o CUPS."
+                echo -e "  Verifique: ${YELLOW}journalctl -u cups --no-pager | tail -20${NC}"
+            fi
+        fi
+    fi
     
     echo -e "${YELLOW}--> Portas adicionais de aplicações ativas (Nginx/Reverb/Sites):${NC}"
     netstat -tuln | grep -E 'nginx|php|artisan' | awk '{print $4}' | sed 's/.*://' | sort -nu | while read -r port; do
@@ -56,6 +133,19 @@ validar_infra() {
 
     echo -e "\n${YELLOW}--> Status dos Processos no Supervisor:${NC}"
     sudo supervisorctl status
+
+    # Validação da impressora HyperViewerPrinter
+    echo -e "\n${YELLOW}--> Status da Impressora Virtual HyperViewerPrinter:${NC}"
+    local lp_out
+    lp_out=$(lpstat -p HyperViewerPrinter 2>&1)
+    if echo "$lp_out" | grep -qi "printer HyperViewerPrinter\|impressora HyperViewerPrinter"; then
+        echo -e "[ ${GREEN}OK${NC} ] Impressora HyperViewerPrinter está instalada."
+        echo "$lp_out" | head -3
+    else
+        echo -e "[ ${RED}AUSENTE${NC} ] Impressora HyperViewerPrinter não encontrada."
+        echo -e "  Execute a opção 6 do menu ou rode: ${YELLOW}sudo bash $WWW_DIR/HyperViewer/scripts/install_printer.sh${NC}"
+        echo -e "  Saída do lpstat: $lp_out"
+    fi
     
     echo -e "${GREEN}=======================================================${NC}\n"
 }
@@ -65,6 +155,7 @@ validar_infra() {
 # ==============================================================================
 instalar_infra() {
     check_root
+    liberar_lock
 
     if [ -d "$WWW_DIR" ] || [ -d "$PROGRAMS_DIR" ]; then
         echo -e "${YELLOW}[AVISO] Já existem estruturas de pastas locais neste diretório.${NC}"
@@ -99,20 +190,43 @@ instalar_infra() {
     # Instalar PHP 8.5 e Extensões necessárias
     add-apt-repository ppa:ondrej/php -y
     apt update
-    apt install -y php8.5-fpm php8.5-cli php8.5-mysql php8.5-curl php8.5-xml php8.5-mbstring php8.5-zip php8.5-bcmath php8.5-soap php8.5-intl php8.5-readline php8.5-gd
+    apt install -y php8.5-fpm php8.5-cli php8.5-mysql php8.5-curl php8.5-xml \
+    php8.5-mbstring php8.5-zip php8.5-bcmath php8.5-soap php8.5-intl \
+    php8.5-readline php8.5-gd php8.5-snmp php8.5-sqlite3 php8.5-imagick \
+    ghostscript
+
+    # Garante que a função exec() não está desabilitada (necessária para o sistema)
+    PHP_INI_CLI=$(php8.5 --ini | grep "Loaded Configuration" | head -1 | awk '{print $NF}')
+    PHP_INI_FPM="/etc/php/8.5/fpm/php.ini"
+    for ini in "$PHP_INI_CLI" "$PHP_INI_FPM"; do
+        if [ -f "$ini" ]; then
+            sed -i 's/^disable_functions =.*/disable_functions = /' "$ini"
+            echo -e "${GREEN}[OK] exec() habilitada em $ini${NC}"
+        fi
+    done
 
     # Composer
     curl -sS https://getcomposer.org/installer | php
     mv composer.phar /usr/local/bin/composer
 
-    # MariaDB
+    # MariaDB - pré-configura a senha root para evitar prompt interativo
+    echo -e "${GREEN}--> Pré-configurando senha do MariaDB...${NC}"
+    debconf-set-selections <<< "mariadb-server mariadb-server/root_password password $DB_PASS"
+    debconf-set-selections <<< "mariadb-server mariadb-server/root_password_again password $DB_PASS"
+
     apt install -y mariadb-server mariadb-client
     systemctl enable --now mariadb
+
+    # Aguarda o MariaDB ficar pronto
+    sleep 2
 
     # Configurando Banco de Dados usando o usuário ROOT nativo por senha pura
     echo -e "${GREEN}--> Alterando credenciais do usuário 'root' no MariaDB...${NC}"
     mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING '$DB_PASS';"
     mysql -e "FLUSH PRIVILEGES;"
+
+    # Atualiza a variável MYSQL_PWD para comandos futuros
+    export MYSQL_PWD="$DB_PASS"
 
     # [SIMPLIFICAÇÃO] Ignorando o banco interno do phpMyAdmin e instalando direto sem dependências extras
     echo -e "${GREEN}--> Configurando instalador do phpMyAdmin de forma limpa...${NC}"
@@ -150,6 +264,9 @@ instalar_infra() {
     ln -sf /usr/share/phpmyadmin "$WWW_DIR/phpmyadmin"
 
     # Configuração do CUPS
+    echo -e "${GREEN}--> Instalando printer-driver-cups-pdf e ghostscript para impressão virtual PDF...${NC}"
+    apt install -y cups printer-driver-cups-pdf ghostscript
+
     echo -e "${GREEN}--> Configurando roteamento e acessos irrestritos do CUPS...${NC}"
     systemctl stop cups
     sed -i 's/^Listen localhost:.*/Listen *:65014/' /etc/cups/cupsd.conf
@@ -159,8 +276,49 @@ instalar_infra() {
     sed -i 's/<Location \/>/<Location \/>\n  Order allow,deny\n  Allow all/' /etc/cups/cupsd.conf
     sed -i 's/<Location \/admin>/<Location \/admin>\n  Order allow,deny\n  Allow all/' /etc/cups/cupsd.conf
     
-    cupsctl --remote-admin --remote-any --share-printers
     systemctl start cups
+    
+    # cupsctl precisa do CUPS rodando
+    sleep 2
+
+    # Verifica se o CUPS realmente iniciou
+    if ! systemctl is-active --quiet cups; then
+        echo -e "${YELLOW}[AVISO] CUPS não iniciou na primeira tentativa. Tentando novamente...${NC}"
+        systemctl start cups
+        sleep 2
+        if ! systemctl is-active --quiet cups; then
+            echo -e "${RED}[ERRO] CUPS não conseguiu iniciar. Verifique o log: journalctl -u cups${NC}"
+        fi
+    fi
+
+    cupsctl --remote-admin --remote-any --share-printers
+
+    # Instala a impressora virtual HyperViewerPrinter
+    PRINTER_SCRIPT="$WWW_DIR/HyperViewer/scripts/install_printer.sh"
+    if [ -f "$PRINTER_SCRIPT" ]; then
+        echo -e "${GREEN}--> Instalando impressora virtual HyperViewerPrinter...${NC}"
+        bash "$PRINTER_SCRIPT"
+    else
+        echo -e "${YELLOW}[AVISO] Script install_printer.sh não encontrado em $PRINTER_SCRIPT.${NC}"
+        echo -e "${YELLOW}Para instalar manualmente, execute: sudo bash $WWW_DIR/HyperViewer/scripts/install_printer.sh${NC}"
+    fi
+
+    # Gera o config.json se não existir (necessário para o instalador web)
+    CONFIG_JSON="$WWW_DIR/HyperViewer/src/config.json"
+    if [ ! -f "$CONFIG_JSON" ]; then
+        echo -e "${GREEN}--> Gerando config.json padrão...${NC}"
+        LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [ -z "$LOCAL_IP" ] && LOCAL_IP="127.0.0.1"
+        cat > "$CONFIG_JSON" <<EOF
+{
+    "port": "65000",
+    "ip": {
+        "value": "${LOCAL_IP}"
+    }
+}
+EOF
+        echo -e "${GREEN}[OK] config.json criado em $CONFIG_JSON${NC}"
+    fi
 
     # Geração dos blocos Nginx Core
     echo -e "${GREEN}--> Escrevendo Virtual Hosts do Nginx...${NC}"
@@ -476,6 +634,7 @@ remover_app() {
 # ==============================================================================
 desinstalar_infra() {
     check_root
+    liberar_lock
     echo -e "${RED}⚠️ ATENÇÃO! Isso irá remover o Nginx, PHP, MariaDB, Supervisor, phpMyAdmin e configurações de sistema.${NC}"
     read -p "Tem certeza absoluta que deseja desinstalar a infraestrutura? (y/n): " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -494,9 +653,16 @@ desinstalar_infra() {
     echo "dbconfig-common dbconfig-common/purge boolean false" | debconf-set-selections
 
     echo -e "${RED}--> Purgando pacotes do sistema de forma 100% silenciosa...${NC}"
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y nginx nginx-common php8.5* mariadb-server mariadb-client phpmyadmin supervisor cups dbconfig-common
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
-    apt-get clean
+    apt-get purge -y -q \
+        nginx nginx-common \
+        php8.5-fpm php8.5-cli php8.5-mysql php8.5-curl php8.5-xml \
+        php8.5-mbstring php8.5-zip php8.5-bcmath php8.5-soap php8.5-intl \
+        php8.5-readline php8.5-gd php8.5-snmp php8.5-sqlite3 php8.5-imagick \
+        mariadb-server mariadb-client \
+        phpmyadmin supervisor cups cups-pdf cups-client \
+        ghostscript dbconfig-common 2>/dev/null
+    apt-get autoremove -y -q 2>/dev/null
+    apt-get clean -q 2>/dev/null
 
     echo -e "${YELLOW}--> Os pacotes do sistema foram removidos.${NC}"
     read -p "Deseja excluir também as suas pastas locais 'www/' e 'programs/' por completo? (y/n): " DEL_FOLDERS
@@ -513,19 +679,130 @@ desinstalar_infra() {
 }
 
 # ==============================================================================
+# 6) ATUALIZAR AMBIENTE CORE (APT APENAS, SEM SOBRESCREVER CONFIG)
+# ==============================================================================
+atualizar_infra() {
+    check_root
+    liberar_lock
+
+    echo -e "${BLUE}=======================================================${NC}"
+    echo -e "${BLUE}      Atualização do Ambiente Core (Apenas Pacotes)    ${NC}"
+    echo -e "${BLUE}=======================================================${NC}"
+    echo -e "${YELLOW}Esta operação apenas atualiza os pacotes do sistema.${NC}"
+    echo -e "${YELLOW}Nenhuma configuração existente será sobrescrita.${NC}\n"
+
+    read -p "Deseja continuar com a atualização? (y/n): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}Operação cancelada.${NC}"
+        return
+    fi
+
+    echo -e "${GREEN}--> Atualizando lista de repositórios...${NC}"
+    apt update
+
+    echo -e "\n${GREEN}--> Atualizando pacotes do sistema...${NC}"
+    apt upgrade -y
+
+    echo -e "\n${GREEN}--> Atualizando PHP e extensões...${NC}"
+    apt install -y --only-upgrade php8.5-fpm php8.5-cli php8.5-mysql php8.5-curl php8.5-xml \
+        php8.5-mbstring php8.5-zip php8.5-bcmath php8.5-soap php8.5-intl \
+        php8.5-readline php8.5-gd php8.5-snmp php8.5-sqlite3 php8.5-imagick
+
+    echo -e "\n${GREEN}--> Atualizando CUPS e dependências...${NC}"
+    apt install -y --only-upgrade cups printer-driver-cups-pdf cups-client ghostscript
+
+    echo -e "\n${GREEN}--> Limpando pacotes obsoletos...${NC}"
+    apt autoremove -y
+    apt autoclean
+
+    echo -e "\n${GREEN}--> Reiniciando serviços...${NC}"
+    systemctl restart cups
+
+    echo -e "\n${GREEN}====== Atualização Concluída ======${NC}"
+}
+
+# ==============================================================================
+# 7) DESINSTALAR IMPRESSORA HyperViewerPrinter
+# ==============================================================================
+desinstalar_impressora() {
+    check_root
+
+    local PRINTER_NAME="HyperViewerPrinter"
+    local PPD_FILE="/etc/cups/ppd/${PRINTER_NAME}.ppd"
+
+    echo -e "${RED}=======================================================${NC}"
+    echo -e "${RED}   Desinstalação da Impressora HyperViewerPrinter      ${NC}"
+    echo -e "${RED}=======================================================${NC}"
+
+    # Verifica múltiplas formas de detectar a impressora
+    local printer_found=false
+    if lpstat -p "$PRINTER_NAME" 2>/dev/null | grep -qi "printer $PRINTER_NAME\|impressora $PRINTER_NAME"; then
+        printer_found=true
+    elif [ -f "$PPD_FILE" ]; then
+        echo -e "${YELLOW}-> PPD encontrado em $PPD_FILE (CUPS pode estar offline)${NC}"
+        printer_found=true
+    elif grep -q "^<Printer $PRINTER_NAME>" /etc/cups/printers.conf 2>/dev/null; then
+        echo -e "${YELLOW}-> Impressora encontrada no /etc/cups/printers.conf${NC}"
+        printer_found=true
+    fi
+
+    if ! $printer_found; then
+        echo -e "${YELLOW}Impressora '$PRINTER_NAME' não encontrada (verificado via lpstat, PPD e printers.conf).${NC}"
+        return
+    fi
+
+    read -p "Tem certeza que deseja remover a impressora '$PRINTER_NAME'? (y/n): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}Operação cancelada.${NC}"
+        return
+    fi
+
+    echo -e "${RED}--> Cancelando trabalhos pendentes...${NC}"
+    cancel -a "$PRINTER_NAME" 2>/dev/null
+
+    echo -e "${RED}--> Desabilitando impressora...${NC}"
+    cupsdisable "$PRINTER_NAME" 2>/dev/null
+
+    echo -e "${RED}--> Removendo impressora do CUPS...${NC}"
+    lpadmin -x "$PRINTER_NAME" 2>/dev/null
+
+    echo -e "${RED}--> Removendo arquivo PPD...${NC}"
+    rm -f "/etc/cups/ppd/${PRINTER_NAME}.ppd"
+
+    echo -e "${RED}--> Restaurando configuração original do cups-pdf...${NC}"
+    if [ -f /etc/cups/cups-pdf.conf ]; then
+        rm -f /etc/cups/cups-pdf.conf
+    fi
+
+    echo -e "\n${GREEN}[OK] Impressora '$PRINTER_NAME' desinstalada com sucesso!${NC}"
+    echo -e "${YELLOW}Recomenda-se reiniciar o CUPS:${NC}"
+    echo -e "  sudo systemctl restart cups\n"
+}
+
+# ==============================================================================
 # INTERFACE PRINCIPAL (MENU DE LOOP INTERATIVO)
 # ==============================================================================
 while true; do
     echo -e "${BLUE}=======================================================${NC}"
     echo -e "${BLUE}    Painel de Gerenciamento Avançado de Aplicações     ${NC}"
     echo -e "${BLUE}=======================================================${NC}"
-    echo -e "Escolha uma das opções abaixo:"
+    echo -e ""
+    echo -e "${GREEN}--- Ambiente Core ---${NC}"
     echo -e "1) ${GREEN}Instalar / Sobrescrever Ambiente Core${NC}"
-    echo -e "2) ${BLUE}Adicionar Configuração de Site Existente (Com Artisan/Daemons)${NC}"
-    echo -e "3) ${RED}Remover Configuração de Site Existente${NC}"
-    echo -e "4) ${YELLOW}Validar Status dos Serviços (Portas & Supervisor)${NC}"
-    echo -e "5) Desinstalar Infraestrutura Completa"
-    echo -e "6) Sair"
+    echo -e "2) ${GREEN}Atualizar Ambiente Core (Apenas Pacotes)${NC}"
+    echo -e "3) ${RED}Desinstalar Infraestrutura Completa${NC}"
+    echo -e ""
+    echo -e "${BLUE}--- Sites / Aplicações ---${NC}"
+    echo -e "4) ${BLUE}Adicionar Configuração de Site Existente${NC}"
+    echo -e "5) ${RED}Remover Configuração de Site Existente${NC}"
+    echo -e ""
+    echo -e "${YELLOW}--- Impressora Virtual HyperViewerPrinter ---${NC}"
+    echo -e "6) ${YELLOW}Instalar / Reconfigurar Impressora${NC}"
+    echo -e "7) ${RED}Desinstalar Impressora${NC}"
+    echo -e ""
+    echo -e "${NC}--- Utilitários ---${NC}"
+    echo -e "8) ${YELLOW}Validar Status dos Serviços (Portas & Supervisor)${NC}"
+    echo -e "9) Sair"
     echo -e "${BLUE}=======================================================${NC}"
     read -p "Digite a opção: " OPCAO
 
@@ -534,19 +811,34 @@ while true; do
             instalar_infra
             ;;
         2)
-            adicionar_app
+            atualizar_infra
             ;;
         3)
-            remover_app
-            ;;
-        4)
-            validar_infra
-            ;;
-        5)
             desinstalar_infra
             break
             ;;
+        4)
+            adicionar_app
+            ;;
+        5)
+            remover_app
+            ;;
         6)
+            PRINTER_SCRIPT="$WWW_DIR/HyperViewer/scripts/install_printer.sh"
+            if [ -f "$PRINTER_SCRIPT" ]; then
+                echo -e "${GREEN}--> Instalando/Reconfigurando impressora HyperViewerPrinter...${NC}"
+                bash "$PRINTER_SCRIPT"
+            else
+                echo -e "${RED}[ERRO] Script install_printer.sh não encontrado em $PRINTER_SCRIPT.${NC}"
+            fi
+            ;;
+        7)
+            desinstalar_impressora
+            ;;
+        8)
+            validar_infra
+            ;;
+        9)
             exit 0
             ;;
         *)
